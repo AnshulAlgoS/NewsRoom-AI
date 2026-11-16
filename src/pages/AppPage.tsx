@@ -1,0 +1,425 @@
+import { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import ChatSidebar from "@/components/app/ChatSidebar";
+import Dashboard from "@/components/app/Dashboard";
+import ProfileSetupModal from "@/components/app/ProfileSetupModal";
+import { expandProfileWithAI, generateDailyPlan } from "@/lib/ai";
+import { toast } from "sonner";
+import { doc, setDoc, getDoc } from "firebase/firestore";
+import { db, auth } from "@/lib/firebase";
+
+export interface UserProfile {
+  name: string;
+  degree: string;
+  semester: number;
+  skills: string[];
+  weeklyHours: number;
+  resumeUploaded: boolean;
+  currentRole?: string;
+  targetRole?: string;
+  currentDescription?: string;
+  targetDescription?: string;
+  interviewAnswers?: { question: string, answer: string }[];
+  isGeneratingAI?: boolean;
+  todos?: TodoItem[];
+  progressData?: ProgressData;
+  achievements?: string[];
+  bio?: string;
+  chatHistory?: { id: string; role: "user" | "assistant"; content: string; timestamp: any }[];
+  comparisons?: { id: string; date: any; score: number; missingSkills: string[]; feedback: string }[];
+  aspirations?: string[];
+  dailyPlanStatus?: {
+    date: string;
+    isConfirmed: boolean;
+  };
+  dailyFocus?: string;
+}
+
+export interface TargetProfile {
+  id: string;
+  name: string;
+  title: string;
+  company: string;
+  skills: string[];
+  isActive: boolean;
+}
+
+export interface ProgressData {
+  overallProgress: number;
+  semesterProgress: number;
+  skillsCompleted: number;
+  skillsTotal: number;
+  estimatedMonths: number;
+  skillGaps: Array<{ name: string; current: number; target: number }>;
+}
+
+export interface TodoItem {
+  id: string;
+  text: string;
+  completed: boolean;
+  date: Date;
+  category: "dsa" | "project" | "learning" | "other";
+}
+
+const AppPage = () => {
+  const navigate = useNavigate();
+  const [showProfileSetup, setShowProfileSetup] = useState(false); // Default to false, check DB first
+  const [isLoading, setIsLoading] = useState(true);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [targetProfiles, setTargetProfiles] = useState<TargetProfile[]>([]);
+  
+  // Lifted Calendar State
+  const [calendarTodos, setCalendarTodos] = useState<TodoItem[]>([]);
+
+  const [progressData, setProgressData] = useState<ProgressData>({
+    overallProgress: 0,
+    semesterProgress: 0, 
+    skillsCompleted: 0,
+    skillsTotal: 20,
+    estimatedMonths: 24,
+    skillGaps: [
+      { name: "Verification", current: 0, target: 80 },
+      { name: "Data reporting", current: 0, target: 75 },
+      { name: "Story development", current: 0, target: 85 },
+      { name: "Source evaluation", current: 0, target: 90 },
+    ],
+  });
+
+  // Helper to run AI analysis
+  const runAIAnalysis = async (profile: UserProfile) => {
+    const user = auth.currentUser;
+    if (!user) return;
+
+    // Set generating state
+    setUserProfile(prev => prev ? { ...prev, isGeneratingAI: true } : { ...profile, isGeneratingAI: true });
+
+    try {
+      const currentDesc = await expandProfileWithAI(
+        profile.currentRole || "Student", 
+        "current",
+        profile.interviewAnswers
+      );
+
+      const targetDesc = await expandProfileWithAI(
+        profile.targetRole || "Data journalist", 
+        "target",
+        profile.interviewAnswers
+      );
+
+      const finalProfile = {
+        ...profile,
+        currentDescription: currentDesc,
+        targetDescription: targetDesc,
+        isGeneratingAI: false
+      };
+
+      const analysisUpdates = {
+        currentDescription: currentDesc,
+        targetDescription: targetDesc,
+        isGeneratingAI: false
+      };
+      setUserProfile(previous => previous ? { ...previous, ...analysisUpdates } : finalProfile);
+      await setDoc(doc(db, "users", user.uid), analysisUpdates, { merge: true });
+      toast.success("AI Analysis Updated");
+    } catch (error) {
+      console.error("AI Analysis Failed:", error);
+      setUserProfile(prev => prev ? { ...prev, isGeneratingAI: false } : null);
+    }
+  };
+
+  // Fetch User Data on Mount
+  useEffect(() => {
+    const unsubscribe = auth.onAuthStateChanged(async (user) => {
+      if (user) {
+        try {
+          const userDocRef = doc(db, "users", user.uid);
+          const userDoc = await getDoc(userDocRef);
+
+          if (userDoc.exists()) {
+            const data = userDoc.data() as UserProfile;
+            setUserProfile(data);
+            
+            // CHECK FOR FAILED AI ANALYSIS AND RETRY
+            if (
+              !data.currentDescription || 
+              data.currentDescription.includes("Unable to generate") || 
+              data.currentDescription.includes("Error:") ||
+              !data.targetDescription ||
+              data.targetDescription.includes("Unable to generate")
+            ) {
+              console.log("Detected failed or missing AI analysis, retrying...");
+              runAIAnalysis(data);
+            }
+
+            // Load Todos if available
+            if (data.todos && data.todos.length > 0) {
+              // Convert Firestore Timestamps to Date objects
+              const loadedTodos = data.todos.map((t: any) => ({
+                ...t,
+                date: t.date?.toDate ? t.date.toDate() : new Date(t.date),
+              }));
+              
+              // Check for legacy hardcoded data
+              const hasLegacyData = loadedTodos.some((t: any) => t.text === "Solve 3 LeetCode problems");
+              if (hasLegacyData) {
+                 // Clean legacy data
+                 setCalendarTodos([]);
+                 generateSmartPlan(data);
+              } else {
+                 setCalendarTodos(loadedTodos);
+              }
+            } else {
+               // No todos found, generate smart plan
+               generateSmartPlan(data);
+            }
+
+            // Load Progress Data if available
+            if (data.progressData) {
+              setProgressData(data.progressData);
+            }
+            
+            // Reconstruct target profile
+            if (data.targetRole) {
+              setTargetProfiles([{
+                id: "1",
+                name: "Target Role", 
+                title: data.targetRole,
+                company: "Tech Giant",
+                skills: ["React", "Node.js", "Data reporting"], // This should ideally be saved/loaded too
+                isActive: true
+              }]);
+            }
+          } else {
+            setShowProfileSetup(true);
+          }
+        } catch (error: any) {
+          console.error("Error fetching user data:", error);
+          if (error.code === 'permission-denied') {
+            toast.error("Database Permission Error", {
+              description: "Please check your Firestore Rules in the Firebase Console."
+            });
+          } else {
+            toast.error("Failed to load profile");
+          }
+        }
+      } else {
+        navigate("/auth", { replace: true });
+      }
+      setIsLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  const generateSmartPlan = async (profile: UserProfile) => {
+    try {
+      const plan = await generateDailyPlan(profile);
+      if (plan && plan.todos) {
+        const newTodos: TodoItem[] = plan.todos.map((t: any, i: number) => ({
+          id: Date.now().toString() + i,
+          text: t.text,
+          completed: false,
+          date: new Date(),
+          category: t.category
+        }));
+        setCalendarTodos(newTodos);
+        
+        // Save to Firestore
+        const user = auth.currentUser;
+        if (user) {
+          await setDoc(doc(db, "users", user.uid), { 
+            todos: newTodos,
+            dailyFocus: plan.dailyFocus || "Let's make today productive!"
+          }, { merge: true });
+          
+          // Update local state for focus
+          setUserProfile(prev => prev ? ({ ...prev, dailyFocus: plan.dailyFocus }) : null);
+        }
+        
+        toast.success("AI Daily Plan Ready", { description: plan.dailyFocus });
+      }
+    } catch (e) {
+      console.error("Failed to generate plan", e);
+    }
+  };
+
+  const handleProfileComplete = async (profileData: UserProfile) => {
+    const user = auth.currentUser;
+    if (!user) {
+      toast.error("You must be logged in to save your profile.");
+      return;
+    }
+
+    // 1. Update Local State
+    const initialProfile = { ...profileData, isGeneratingAI: true };
+    setUserProfile(previous => previous ? { ...previous, ...initialProfile } : initialProfile);
+    setShowProfileSetup(false);
+    
+    // Create a target profile based on the user's target role
+    const newTarget: TargetProfile = {
+      id: "1",
+      name: "Target Role", 
+      title: profileData.targetRole || "Data journalist",
+      company: "Tech Giant",
+      skills: ["React", "Node.js", "Data reporting"],
+      isActive: true
+    };
+    setTargetProfiles([newTarget]);
+
+    // 2. Save Initial Data to Firestore
+    try {
+      await setDoc(doc(db, "users", user.uid), initialProfile, { merge: true });
+      
+      // Update progress data based on new skills
+      if (profileData.skills && profileData.skills.length > 0) {
+         const generatedGaps = profileData.skills.slice(0, 6).map((skill: string) => ({
+           name: skill,
+           current: 10, 
+           target: 85
+         }));
+         const newProgress = {
+            ...progressData,
+            skillGaps: generatedGaps,
+            skillsCompleted: Math.max(1, Math.floor(profileData.skills.length * 0.2)),
+            skillsTotal: profileData.skills.length + 5
+         };
+         setProgressData(newProgress);
+         // Save progress too
+         await setDoc(doc(db, "users", user.uid), { progressData: newProgress }, { merge: true });
+      }
+
+      toast.success("Profile saved!");
+    } catch (error: any) {
+      console.error("Error saving profile:", error);
+      if (error.code === 'permission-denied') {
+        toast.error("Permission Denied", { description: "Check Firestore Rules in Firebase Console." });
+      } else {
+        toast.error("Failed to save profile to database.");
+      }
+      setUserProfile(previous => previous ? { ...previous, isGeneratingAI: false } : previous);
+      setShowProfileSetup(true);
+      return;
+    }
+
+    await runAIAnalysis(profileData);
+    await generateSmartPlan(profileData);
+  };
+
+  const handleUpdateProgress = async (newData: Partial<ProgressData>) => {
+    const updatedProgress = { ...progressData, ...newData };
+    setProgressData(updatedProgress);
+    
+    const user = auth.currentUser;
+    if (user) {
+      try {
+        await setDoc(doc(db, "users", user.uid), { progressData: updatedProgress }, { merge: true });
+      } catch (error) {
+        console.error("Error saving progress:", error);
+      }
+    }
+  };
+
+  const saveTodos = async (newTodos: TodoItem[]) => {
+    const user = auth.currentUser;
+    if (user) {
+      try {
+        await setDoc(doc(db, "users", user.uid), { todos: newTodos }, { merge: true });
+      } catch (error) {
+        console.error("Error saving todos:", error);
+      }
+    }
+  };
+
+  const handleAddTodo = (text: string, category: TodoItem["category"] = "learning") => {
+    const newTodo: TodoItem = {
+      id: Date.now().toString(),
+      text,
+      completed: false,
+      date: new Date(),
+      category,
+    };
+    const updatedTodos = [...calendarTodos, newTodo];
+    setCalendarTodos(updatedTodos);
+    saveTodos(updatedTodos);
+    toast.success("Task Added", { description: `Added "${text}" to your calendar.` });
+  };
+
+  const handleAddTodos = (newTasks: { text: string, category: TodoItem["category"] }[]) => {
+    const addedTodos = newTasks.map((task, i) => ({
+      id: Date.now().toString() + i,
+      text: task.text,
+      completed: false,
+      date: new Date(),
+      category: task.category || "learning"
+    })) as TodoItem[];
+    
+    const updatedTodos = [...calendarTodos, ...addedTodos];
+    setCalendarTodos(updatedTodos);
+    saveTodos(updatedTodos);
+    toast.success("Tasks Updated", { description: `Added ${addedTodos.length} new tasks from AI.` });
+  };
+
+  const handleToggleTodo = (id: string) => {
+    const updatedTodos = calendarTodos.map(t => t.id === id ? { ...t, completed: !t.completed } : t);
+    setCalendarTodos(updatedTodos);
+    saveTodos(updatedTodos);
+  };
+
+  const handleDeleteTodo = (id: string) => {
+    const updatedTodos = calendarTodos.filter(t => t.id !== id);
+    setCalendarTodos(updatedTodos);
+    saveTodos(updatedTodos);
+  };
+
+  const handleUpdateProfile = async (updates: Partial<UserProfile>) => {
+    setUserProfile(previous => previous ? { ...previous, ...updates } : previous);
+
+    const user = auth.currentUser;
+    if (user) {
+      try {
+        await setDoc(doc(db, "users", user.uid), updates, { merge: true });
+        toast.success("Profile updated");
+      } catch (error) {
+        console.error("Error saving profile updates:", error);
+        toast.error("Could not save profile changes. Please retry.");
+      }
+    }
+  };
+
+  const activeTarget = targetProfiles.find((t) => t.isActive);
+
+  if (isLoading || !auth.currentUser) return <div role="status" className="p-8">Loading your dashboard...</div>;
+
+  return (
+    <div className="flex h-screen bg-background font-sans">
+      {/* Profile Setup Modal */}
+      {showProfileSetup && (
+        <ProfileSetupModal onComplete={handleProfileComplete} />
+      )}
+
+      {/* Chat Sidebar */}
+      <ChatSidebar
+        userProfile={userProfile}
+        activeTarget={activeTarget}
+        onProfileEdit={() => setShowProfileSetup(true)}
+        onUpdateProgress={handleUpdateProgress}
+        onAddTodo={handleAddTodo}
+        onAddTodos={handleAddTodos}
+        onUpdateProfile={handleUpdateProfile}
+      />
+
+      {/* Dashboard */}
+      <Dashboard
+        progressData={progressData}
+        activeTarget={activeTarget}
+        userProfile={userProfile}
+        calendarTodos={calendarTodos}
+        onToggleTodo={handleToggleTodo}
+        onDeleteTodo={handleDeleteTodo}
+        onAddTodo={handleAddTodo}
+      />
+    </div>
+  );
+};
+
+export default AppPage;
